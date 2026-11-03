@@ -2,7 +2,7 @@
 
 Multiple linear regression in R predicting global video game sales from critic score, genre and console, framed as a decision tool for a game publisher deciding where to invest.
 
-Final project for BMGT430 at the University of Maryland, Robert H. Smith School of Business. Team: Jacob Cohen, Edouard Atanesyan, Alec Nahum, Jason Lee. Revised after submission to address instructor feedback (see [Revisions](#revisions)).
+Final project for BMGT430 at the University of Maryland, Robert H. Smith School of Business. 
 
 **[View the full report](Final_Project_BMGT430.html)** (download and open in a browser, or view through GitHub Pages)
 
@@ -61,14 +61,3 @@ rmarkdown::render("Final_Project_BMGT430.Rmd")
 | `Final_Project_BMGT430.Rmd` | R Markdown source: data cleaning, models, diagnostics and write-up |
 | `Final_Project_BMGT430.html` | Rendered report |
 | `README.md` | This file |
-
-## Revisions
-
-After grading, the project was revised to address instructor feedback:
-
-- Clarified that the normality assumption applies to the residuals, not the dependent variable
-- Grouped rare consoles and genres into "Other" to simplify the model
-- Tested critic score interactions with console and with genre, and adopted the console interaction
-- Explained the banding in the residual plot (sales are rounded to 0.01 million units) and added a sensitivity check excluding low-selling titles
-- Corrected the interpretation of log-scale coefficients
-- Added separate partial F-tests for genre and for console, in addition to the joint test
