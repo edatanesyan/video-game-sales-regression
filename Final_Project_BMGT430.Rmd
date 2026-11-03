@@ -1,0 +1,387 @@
+---
+title: Regression Analysis of Global Video Game Sales
+author: Edouard Atanesyan
+date: 5/9/2026
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor: visual
+---
+
+```{r setup, include=FALSE}
+# Global chunk options: hide code, warnings and messages in the rendered report
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(car)
+library(GGally)
+
+# Load the data
+vg_raw <- read.csv("vgchartz-2024.csv")
+
+# Count missing values in the key variables before filtering, so the
+# numbers quoted in the report are computed rather than typed in
+n_raw         <- nrow(vg_raw)
+n_na_sales    <- sum(is.na(vg_raw$total_sales))
+n_na_critic   <- sum(is.na(vg_raw$critic_score))
+n_na_genre    <- sum(is.na(vg_raw$genre) | vg_raw$genre == "")
+n_na_console  <- sum(is.na(vg_raw$console) | vg_raw$console == "")
+
+# Keep rows with both sales and critic score
+vg <- vg_raw[!is.na(vg_raw$total_sales) & !is.na(vg_raw$critic_score) &
+             vg_raw$genre != "" & vg_raw$console != "", ]
+
+# log() is undefined at zero, so drop games with zero recorded sales
+n_zero <- sum(vg$total_sales == 0)
+vg <- vg[vg$total_sales > 0, ]
+n_final <- nrow(vg)
+
+# Response variable: natural log of global sales (millions of units)
+vg$log_sales <- log(vg$total_sales)
+
+# Full-detail categorical variables (used in the original specification)
+vg$genre   <- relevel(factor(vg$genre), ref = "Action")
+vg$console <- factor(vg$console)
+
+# Simplified categorical variables:
+#  - consoles with fewer than 100 titles in the sample are combined into "Other"
+#  - genres with fewer than 50 titles in the sample are combined into "Other"
+# The most common level in each variable is used as the reference group
+vg$console_grp <- fct_lump_min(vg$console, min = 100, other_level = "Other") %>%
+  fct_relevel("X360")
+vg$genre_grp <- fct_lump_min(vg$genre, min = 50, other_level = "Other") %>%
+  fct_relevel("Action")
+
+# Record which levels were folded into "Other" so the report can list them
+other_consoles <- sort(setdiff(levels(vg$console), levels(vg$console_grp)))
+other_genres   <- sort(setdiff(levels(vg$genre),   levels(vg$genre_grp)))
+n_console_grp  <- nlevels(vg$console_grp)
+n_genre_grp    <- nlevels(vg$genre_grp)
+```
+
+## The Problem
+
+The global video game industry generates hundreds of billions of dollars in annual revenue, yet many titles fail to recoup their development costs. A **game publisher or studio executive** needs to understand which factors drive global sales in order to make smarter decisions about which genres to invest in, which consoles to target, and how critic reception translates into commercial performance.
+
+This analysis uses multiple linear regression to predict global video game sales using critic score, genre, and console. The dataset is the *Video Game Sales 2024* dataset from VGChartz, available on Kaggle (<https://www.kaggle.com/datasets/asaniczka/video-game-sales-2024>). It covers over 64,000 commercial releases from 1971 to 2024.
+
+## Descriptive Analysis
+
+### Missing Values
+
+The raw dataset contained `r format(n_raw, big.mark = ",")` observations. Of the key variables used in this analysis, **total_sales** had `r format(n_na_sales, big.mark = ",")` missing values and **critic_score** had `r format(n_na_critic, big.mark = ",")` missing values. **genre** and **console** had `r n_na_genre + n_na_console` missing values. Because **critic_score** is central to our research question, we removed all rows missing either sales or critic score, and dropped `r n_zero` titles with zero recorded sales because the log of zero is undefined. The working dataset contains `r format(n_final, big.mark = ",")` observations.
+
+This filtering matters for interpretation. Critic scores are mostly recorded for prominent releases, so the sample over-represents well-known games, and the results describe that population rather than every game ever released.
+
+### Distribution of the Dependent Variable
+
+```{r, fig.height=5, fig.width=10}
+# Side-by-side histograms of raw and log-transformed global sales
+par(mfrow = c(1, 2))
+
+hist(vg$total_sales, breaks = 60, col = "blue",
+     main = "Distribution of Global Sales (Raw)",
+     xlab = "Global Sales (Millions)", ylab = "Frequency")
+
+hist(vg$log_sales, breaks = 40, col = "green",
+     main = "Distribution of log(Global Sales)",
+     xlab = "log(Global Sales)", ylab = "Frequency")
+
+par(mfrow = c(1, 1))
+```
+
+Raw global sales are heavily right-skewed: a small number of blockbusters sell tens of millions of units while most titles sell well under one million. After the log transformation the distribution is approximately symmetric.
+
+Linear regression does not require the dependent variable itself to be normally distributed. The normality assumption applies to the **error terms**, which we check through the residuals of the fitted model below. We use the log transformation for two other reasons: it keeps a handful of extreme blockbusters from dominating the fit, and it lets us read coefficients as percentage changes in sales, which is a natural scale for a business decision.
+
+### Relationships Among Variables
+
+```{r, fig.height=6, fig.width=7}
+# Scatterplot, densities and correlation for the response and numeric predictor
+vg[, c("log_sales", "critic_score")] %>% ggpairs()
+```
+
+Critic score has a positive correlation with log(Global Sales), suggesting higher-reviewed games tend to sell more.
+
+```{r, fig.height=5, fig.width=10}
+# Median raw sales by genre and by console, sorted for readability
+par(mfrow = c(1, 2))
+
+genre_med <- sort(tapply(vg$total_sales, vg$genre_grp, median))
+barplot(genre_med, horiz = TRUE, las = 1, col = "purple",
+        main = "Median Global Sales by Genre", xlab = "Median Sales (Millions)",
+        cex.names = 0.7)
+
+console_med <- sort(tapply(vg$total_sales, vg$console_grp, median))
+barplot(console_med, horiz = TRUE, las = 1, col = "red",
+        main = "Median Global Sales by Console", xlab = "Median Sales (Millions)",
+        cex.names = 0.8)
+
+par(mfrow = c(1, 1))
+```
+
+Median sales vary meaningfully across both genre and console, suggesting both will be useful predictors in the regression model.
+
+### Simplifying the Categorical Variables
+
+In the filtered sample, console has `r nlevels(vg$console)` levels and genre has `r nlevels(vg$genre)`, and several levels contain only a handful of games (some have a single title). Coefficients estimated from so few observations are unstable and hard to interpret. We therefore combined:
+
+-   **Consoles** with fewer than 100 titles into an "Other" category (`r paste(other_consoles, collapse = ", ")`), leaving `r n_console_grp` console groups. The Xbox 360, the most common console in the sample, is the reference group.
+-   **Genres** with fewer than 50 titles into an "Other" category (`r paste(other_genres, collapse = ", ")`), leaving `r n_genre_grp` genre groups. Action, the most common genre, is the reference group.
+
+The trade-off is that "Other" console mixes very different platforms (for example retro systems and the Switch), so its coefficient should not be read as describing any single console.
+
+## Model Building and Selection
+
+We fit five models using log(total_sales) as the response variable and selected the final model based on partial F-tests, adjusted R², AIC, BIC, and diagnostic plots.
+
+-   **Model 1**: Numeric predictor only, **critic_score**
+-   **Model 2**: Adding categorical predictors with all original levels, **genre** and **console**
+-   **Model 3**: Model 2 with the simplified genre and console groups
+-   **Model 4**: Model 3 with **log(critic_score)** to test a non-linear relationship
+-   **Model 5 (Final)**: Model 3 plus a **critic_score × console** interaction
+
+### Model 1: Numeric Predictor Only
+
+```{r}
+m1 <- lm(log_sales ~ critic_score, data = vg)
+summary(m1)
+```
+
+### Model 2: Adding Categorical Predictors (All Levels)
+
+```{r}
+m2 <- lm(log_sales ~ critic_score + genre + console, data = vg)
+summary(m2)
+```
+
+### Model 3: Simplified Categorical Predictors
+
+```{r}
+m3 <- lm(log_sales ~ critic_score + genre_grp + console_grp, data = vg)
+summary(m3)
+```
+
+Model 3 uses `r length(coef(m3))` coefficients instead of `r length(coef(m2))` and has a lower BIC than Model 2 (`r round(BIC(m3), 1)` vs `r round(BIC(m2), 1)`), at a small cost in adjusted R² (`r round(summary(m3)$adj.r.squared, 3)` vs `r round(summary(m2)$adj.r.squared, 3)`). The simpler grouping keeps nearly all of the explanatory power while making each coefficient easier to read.
+
+### Testing Genre and Console
+
+```{r}
+# Joint test: do genre and console together improve on critic score alone?
+anova(m1, m3)
+```
+
+The partial F-test comparing Model 1 to Model 3 has a p-value well below 0.05. This tells us that **genre and console together** significantly improve model fit. On its own, this joint test does not tell us whether each variable is significant separately.
+
+To test each variable separately, we drop one categorical variable at a time from Model 3 and compare with a partial F-test.
+
+```{r}
+# Separate tests: drop each categorical variable from Model 3 in turn
+m3_no_genre   <- lm(log_sales ~ critic_score + console_grp, data = vg)
+m3_no_console <- lm(log_sales ~ critic_score + genre_grp,   data = vg)
+
+anova(m3_no_genre,   m3)   # H0: all genre coefficients = 0, given critic score and console
+anova(m3_no_console, m3)   # H0: all console coefficients = 0, given critic score and genre
+```
+
+Both p-values are well below 0.05. Genre is significant as a group after controlling for critic score and console, and console is significant as a group after controlling for critic score and genre.
+
+### Model 4: log(critic_score), Tested but Not Selected
+
+```{r}
+m4 <- lm(log_sales ~ log(critic_score) + genre_grp + console_grp, data = vg)
+summary(m4)
+```
+
+### Model 5: Interaction Between Critic Score and Console (Final Model)
+
+The effect of a good review may depend on the platform. A highly rated game on a console with a large, engaged install base may convert reviews into sales differently than one on a handheld or PC. We tested interactions of critic score with console and with genre.
+
+```{r}
+# Candidate interaction models
+m5      <- lm(log_sales ~ critic_score * console_grp + genre_grp, data = vg)
+m5_gen  <- lm(log_sales ~ critic_score * genre_grp + console_grp, data = vg)
+m5_both <- lm(log_sales ~ critic_score * (genre_grp + console_grp), data = vg)
+
+# Partial F-tests of each interaction against the additive Model 3
+anova(m3, m5)
+anova(m3, m5_gen)
+```
+
+Both interaction terms are statistically significant. The critic score × console interaction produces the larger improvement in fit and the lower AIC and BIC of the two, so we carry it forward. Adding both interactions at once lowers AIC slightly further but raises BIC and adds `r length(coef(m5_both)) - length(coef(m5))` more coefficients, so we prefer the more parsimonious Model 5.
+
+```{r}
+summary(m5)
+```
+
+### Model Comparison
+
+```{r}
+# Side-by-side fit statistics for every candidate model
+model_list <- list("Model 1" = m1, "Model 2" = m2, "Model 3" = m3,
+                   "Model 4" = m4, "Model 5" = m5,
+                   "Model 5 + genre interaction" = m5_both)
+
+comparison <- data.frame(
+  Coefficients = sapply(model_list, function(m) length(coef(m))),
+  Adj_R2       = sapply(model_list, function(m) round(summary(m)$adj.r.squared, 4)),
+  AIC          = sapply(model_list, function(m) round(AIC(m), 1)),
+  BIC          = sapply(model_list, function(m) round(BIC(m), 1))
+)
+knitr::kable(comparison)
+```
+
+Model 5 matches the original Model 2 on adjusted R² and beats it on AIC and BIC while using fewer coefficients. Against the additive Model 3, Model 5 has a clearly lower AIC, while BIC, which penalizes extra coefficients more heavily, slightly favors Model 3 (`r round(BIC(m3), 1)` vs `r round(BIC(m5), 1)`). We select Model 5 because the partial F-test shows the interaction is highly significant and because it reveals a substantive, decision-relevant difference in how reviews translate into sales across platforms. Model 4's log transformation of critic score did not improve fit relative to Model 3, so we keep critic score on its original scale. **Model 5 is our final model.**
+
+### Diagnostic Plots: Final Model (Model 5)
+
+```{r, fig.height=5, fig.width=9}
+# Residuals vs fitted, normal Q-Q, and residuals vs leverage with Cook's distance
+par(mfrow = c(1, 3))
+plot(m5, which = c(1, 2, 5))
+par(mfrow = c(1, 1))
+```
+
+The residuals vs. fitted plot shows no strong curvature, and the spread of residuals is roughly constant across fitted values. The Q-Q plot indicates approximate normality of the residuals with some deviation in the tails, which is acceptable given the large sample size. No observation has a Cook's distance close to 1.
+
+**Low-sales pattern.** At the lowest fitted values, the residuals form straight diagonal bands rather than a random cloud. This comes from how VGChartz records sales: figures are rounded to 0.01 million units, so many low-selling games share exactly the same sales value (`r sum(vg$total_sales == 0.01)` titles sit at the 0.01 million floor alone). When many observations share one value of Y but have different fitted values, their residuals fall on a line with slope −1. This is a data-recording artifact rather than evidence of a misspecified model, but it means the model's errors are less well-behaved for the lowest-selling titles.
+
+### Sensitivity Check: Excluding Very Low Sellers
+
+To check whether those low-popularity observations drive our conclusions, we refit the final model without titles that sold 20,000 units or fewer (total_sales ≤ 0.02).
+
+```{r}
+# Refit Model 5 on titles above the rounding floor
+vg_hi <- vg[vg$total_sales > 0.02, ]
+m5_hi <- lm(formula(m5), data = vg_hi)
+
+# Compare key quantities between the full and restricted fits
+sens <- data.frame(
+  Sample                   = c("All titles", "Excluding sales <= 0.02M"),
+  Observations             = c(nrow(vg), nrow(vg_hi)),
+  `Critic score (X360)`    = round(c(coef(m5)["critic_score"], coef(m5_hi)["critic_score"]), 3),
+  Adj_R2                   = round(c(summary(m5)$adj.r.squared, summary(m5_hi)$adj.r.squared), 3),
+  check.names = FALSE
+)
+knitr::kable(sens)
+```
+
+Removing the `r nrow(vg) - nrow(vg_hi)` lowest sellers leaves the critic score coefficient essentially unchanged, with the same sign and significance. Our substantive conclusions are not driven by the low-sales observations.
+
+### Multicollinearity Check
+
+```{r}
+# Multicollinearity is assessed on the additive model; VIFs in a model with
+# interaction terms are inflated by construction and are not informative
+vif(m3)
+```
+
+We check multicollinearity on the additive Model 3, because interaction terms are correlated with their component variables by construction and would inflate VIFs mechanically. Critic score's VIF is close to 1, and the adjusted generalized VIFs (GVIF^(1/(2·Df))) for genre and console are also close to 1, so multicollinearity is not a concern among the explanatory variables.
+
+## Interpretations and Key Findings
+
+```{r include=FALSE}
+# Critic score slope for every console group:
+# reference (X360) slope plus each console's interaction coefficient
+b <- coef(m5)
+consoles <- levels(vg$console_grp)
+slopes <- sapply(consoles, function(cn) {
+  if (cn == "X360") b["critic_score"] else b["critic_score"] + b[paste0("critic_score:console_grp", cn)]
+})
+slope_tbl <- data.frame(
+  Console      = consoles,
+  Slope        = round(slopes, 3),
+  Multiplier   = round(exp(slopes), 2),
+  Pct_change   = paste0(round((exp(slopes) - 1) * 100), "%")
+) %>% arrange(desc(Slope))
+
+b_x360   <- b["critic_score"]
+mult_x360 <- exp(b_x360)
+
+# Selected genre effects for the narrative
+g <- function(lvl) b[paste0("genre_grp", lvl)]
+pct <- function(x) paste0(round(abs(exp(x) - 1) * 100), "%")
+```
+
+The final model explains approximately **`r round(summary(m5)$r.squared * 100, 1)`%** of the variation in log(Global Sales) (adjusted R² = `r round(summary(m5)$adj.r.squared, 3)`). Because the response is log(sales), each coefficient *b* translates into a multiplicative effect on sales: sales are multiplied by e^b, which is a percentage change of (e^b − 1) × 100%.
+
+**Critic Score.** Because of the interaction, the effect of critic score differs by console. For the Xbox 360 reference group, the coefficient is `r round(b_x360, 3)`. A one-point increase in critic score (on its 1 to 10 scale) multiplies expected global sales by e^`r round(b_x360, 3)` ≈ **`r round(mult_x360, 2)`**, that is, about **`r round((mult_x360 - 1) * 100)`% higher sales**, holding genre constant. The table below shows the same effect for every console group.
+
+```{r}
+knitr::kable(slope_tbl, row.names = FALSE,
+             col.names = c("Console", "Critic score slope", "Sales multiplier per +1 point", "Change in sales"))
+```
+
+Critic score is associated with higher sales on every console group, but the size of the payoff varies across platforms. The pattern is clear: reviews matter most on Sony and Microsoft home consoles (PS2, PS4, Xbox 360, PS3, Xbox) and least on Nintendo handhelds (GBA, DS, 3DS) and the Wii. One plausible explanation is that buyers on those Nintendo platforms rely more on first-party franchises and word of mouth than on critic reviews, though the model cannot confirm the reason.
+
+**Genre.** Genre is significant as a group after controlling for critic score and console (separate partial F-test above). Holding critic score and console constant, Puzzle titles sell about `r pct(g("Puzzle"))` less than Action titles, Strategy titles about `r pct(g("Strategy"))` less, and Role-Playing titles about `r pct(g("Role-Playing"))` less. Shooter titles sell about `r pct(g("Shooter"))` more than Action titles. Most other genres are not significantly different from Action.
+
+**Console.** Console is significant as a group after controlling for critic score and genre (separate partial F-test above). Because console now interacts with critic score, the console coefficients describe the difference in sales between platforms for a hypothetical game with a critic score of zero, which is outside the data, so we interpret console differences through the slope table and the boxplots in the appendix rather than through the raw console coefficients.
+
+## Limitations
+
+-   **Sample.** Only titles with a critic score are included, so the sample over-represents prominent releases.
+-   **Physical sales.** VGChartz mainly tracks physical retail sales. Platforms where most sales are digital, notably PC, will appear to sell less than they really do, which likely explains part of PC's low estimated sales.
+-   **Omitted variables.** Marketing budget, franchise status, publisher, and release year are not in the model. Some of what we attribute to console may reflect when those consoles were on the market.
+-   **Association, not causation.** The model shows that well-reviewed games sell more; it does not prove that raising a game's review score would by itself raise its sales.
+
+## Final Summary and Recommendations
+
+Our analysis finds that critic score, genre, and console are useful and statistically significant predictors of global video game sales, and that the payoff from strong reviews depends on the platform. We offer the following recommendations to a studio executive:
+
+**Invest in quality.** Each additional point of critic score is associated with roughly `r round((mult_x360 - 1) * 100)`% higher sales on the reference console, holding genre constant. Taking more time to polish a game before release is associated with meaningfully higher commercial outcomes.
+
+**Match quality investment to the platform.** The return on a higher review score is largest on Sony and Microsoft home consoles and smallest on Nintendo handhelds. Polishing budgets go furthest where the model shows the steepest critic score slope.
+
+**Target high-demand genres.** Shooter titles outsell Action titles on average, while Puzzle, Strategy, and Role-Playing titles sell substantially less, holding critic score and console constant. Studios entering those genres should plan budgets around lower expected unit sales.
+
+## Appendix
+
+### Diagnostic Plots: Model 1
+
+```{r, fig.height=5, fig.width=9}
+par(mfrow = c(1, 3))
+plot(m1, which = c(1, 2, 5))
+par(mfrow = c(1, 1))
+```
+
+### Diagnostic Plots: Model 3
+
+```{r, fig.height=5, fig.width=9}
+par(mfrow = c(1, 3))
+plot(m3, which = c(1, 2, 5))
+par(mfrow = c(1, 1))
+```
+
+### Diagnostic Plots: Model 4
+
+```{r, fig.height=5, fig.width=9}
+par(mfrow = c(1, 3))
+plot(m4, which = c(1, 2, 5))
+par(mfrow = c(1, 1))
+```
+
+### log(Global Sales) by Genre
+
+```{r, fig.height=5, fig.width=10}
+boxplot(log_sales ~ genre_grp, data = vg,
+        main = "log(Global Sales) by Genre",
+        xlab = "", ylab = "log(Global Sales)",
+        las = 2, cex.axis = 0.75)
+```
+
+### log(Global Sales) by Console
+
+```{r, fig.height=5, fig.width=8}
+boxplot(log_sales ~ console_grp, data = vg,
+        main = "log(Global Sales) by Console",
+        xlab = "", ylab = "log(Global Sales)",
+        las = 2)
+```
+
+## References
+
+-   VGChartz. *Video Game Sales Data.* Retrieved via Kaggle: <https://www.kaggle.com/datasets/asaniczka/video-game-sales-2024>
