@@ -4,7 +4,7 @@ Multiple linear regression in R predicting global video game sales from critic s
 
 Final project for BMGT430 at the University of Maryland, Robert H. Smith School of Business. 
 
-**[View the full report](Final_Project_BMGT430.html)** (download and open in a browser, or view through GitHub Pages)
+**[View the full report](https://edatanesyan.github.io/video-game-sales-regression/Final_Project_BMGT430.html)**
 
 ## The question
 
